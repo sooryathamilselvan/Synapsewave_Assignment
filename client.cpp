@@ -6,12 +6,28 @@
 
 #include <iostream>
 #include <string>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <chrono>
 
-bool receiveLine(SOCKET sock, std::string& pending, std::string& line)
+
+const int TCP_PORT = 5000;
+const int UDP_PORT = 5001;
+
+std::atomic<bool> clientRunning{true};
+std::mutex consoleMutex;
+
+// Read one complete line from the TCP stream.
+bool receiveLine(
+    SOCKET sock,
+    std::string& pending,
+    std::string& line
+)
 {
     char buffer[1024];
 
-    while (true)
+    while (clientRunning)
     {
         size_t pos = pending.find('\n');
 
@@ -33,6 +49,85 @@ bool receiveLine(SOCKET sock, std::string& pending, std::string& line)
 
         pending.append(buffer, received);
     }
+
+    return false;
+}
+
+bool sendAll(SOCKET sock, const std::string& message)
+{
+    size_t totalSent = 0;
+
+    while (totalSent < message.size())
+    {
+        int sent = send(
+            sock,
+            message.data() + totalSent,
+            static_cast<int>(message.size() - totalSent),
+            0
+        );
+
+        if (sent <= 0)
+            return false;
+
+        totalSent += static_cast<size_t>(sent);
+    }
+
+    return true;
+}
+
+// Receive broadcasts continuously in a separate thread.
+void receiveMessages(SOCKET tcpSocket)
+{
+    std::string pending;
+    std::string message;
+
+    while (clientRunning)
+    {
+        if (!receiveLine(tcpSocket, pending, message))
+            break;
+
+        std::lock_guard<std::mutex> lock(consoleMutex);
+
+        std::cout << "\n" << message << std::endl;
+    }
+
+    clientRunning = false;
+}
+
+// Send a UDP heartbeat every five seconds.
+void heartbeatSender(
+    SOCKET udpSocket,
+    sockaddr_in udpAddress,
+    std::string userId
+)
+{
+    std::string heartbeat = "HEARTBEAT:" + userId;
+
+    while (clientRunning)
+    {
+        int sent = sendto(
+            udpSocket,
+            heartbeat.c_str(),
+            static_cast<int>(heartbeat.size()),
+            0,
+            reinterpret_cast<sockaddr*>(&udpAddress),
+            sizeof(udpAddress)
+        );
+
+        if (sent == SOCKET_ERROR && clientRunning)
+        {
+            std::lock_guard<std::mutex> lock(consoleMutex);
+            std::cerr << "Heartbeat send failed: "
+                      << WSAGetLastError() << '\n';
+        }
+
+        for (int i = 0; i < 50 && clientRunning; ++i)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(100)
+            );
+        }
+    }
 }
 
 int main()
@@ -45,60 +140,58 @@ int main()
         return 1;
     }
 
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    SOCKET tcpSocket = socket(
+        AF_INET, SOCK_STREAM, IPPROTO_TCP
+    );
 
-    if (sock == INVALID_SOCKET)
+    if (tcpSocket == INVALID_SOCKET)
     {
-        std::cerr << "Socket creation failed.\n";
+        std::cerr << "TCP socket creation failed.\n";
         WSACleanup();
         return 1;
     }
 
-    sockaddr_in address{};
+    sockaddr_in tcpAddress{};
+    tcpAddress.sin_family = AF_INET;
+    tcpAddress.sin_port = htons(TCP_PORT);
 
-    address.sin_family = AF_INET;
-    address.sin_port = htons(5000);
-
-    inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+    inet_pton(AF_INET, "127.0.0.1", &tcpAddress.sin_addr);
 
     if (connect(
-        sock,
-        reinterpret_cast<sockaddr*>(&address),
-        sizeof(address)
+        tcpSocket,
+        reinterpret_cast<sockaddr*>(&tcpAddress),
+        sizeof(tcpAddress)
     ) == SOCKET_ERROR)
     {
-        std::cerr << "Connection failed.\n";
-        closesocket(sock);
+        std::cerr << "TCP connection failed.\n";
+        closesocket(tcpSocket);
         WSACleanup();
         return 1;
     }
 
-    std::string pending;
+    std::cout << "Connected to TCP chat server.\n";
 
-    // Send the user ID first
+    // Authenticate before starting background threads.
     std::string userId;
 
     std::cout << "Enter user ID (user1/user2/user3): ";
     std::getline(std::cin, userId);
 
-    userId += "\n";
-
-    if (send(sock, userId.c_str(),
-             static_cast<int>(userId.size()), 0) == SOCKET_ERROR)
+    if (userId.empty() || !sendAll(tcpSocket, userId + "\n"))
     {
         std::cerr << "Failed to send user ID.\n";
-        closesocket(sock);
+        closesocket(tcpSocket);
         WSACleanup();
         return 1;
     }
 
-    // Wait for server validation
+    std::string pending;
     std::string response;
 
-    if (!receiveLine(sock, pending, response))
+    if (!receiveLine(tcpSocket, pending, response))
     {
         std::cerr << "Server disconnected.\n";
-        closesocket(sock);
+        closesocket(tcpSocket);
         WSACleanup();
         return 1;
     }
@@ -106,32 +199,84 @@ int main()
     if (response != "AUTH_OK")
     {
         std::cout << "Access denied: invalid user ID.\n";
-
-        closesocket(sock);
+        closesocket(tcpSocket);
         WSACleanup();
         return 0;
     }
 
-    std::cout << "User validated successfully!\n";
+    std::cout << "Authentication successful!\n";
+    std::cout << "Type /quit to disconnect.\n";
 
-    // Send a chat message
-    std::string message;
+    SOCKET udpSocket = socket(
+        AF_INET, SOCK_DGRAM, IPPROTO_UDP
+    );
 
-    std::cout << "Enter message: ";
-    std::getline(std::cin, message);
-
-    message += "\n";
-
-    if (send(sock, message.c_str(),
-             static_cast<int>(message.size()), 0) != SOCKET_ERROR)
+    if (udpSocket == INVALID_SOCKET)
     {
-        if (receiveLine(sock, pending, response))
-            std::cout << response << '\n';
+        std::cerr << "UDP socket creation failed.\n";
+        closesocket(tcpSocket);
+        WSACleanup();
+        return 1;
     }
 
-    shutdown(sock, SD_BOTH);
-    closesocket(sock);
+    sockaddr_in udpAddress{};
+    udpAddress.sin_family = AF_INET;
+    udpAddress.sin_port = htons(UDP_PORT);
+
+    inet_pton(AF_INET, "127.0.0.1", &udpAddress.sin_addr);
+
+    // Start continuous message receiving and heartbeats.
+    std::thread receiverThread(receiveMessages, tcpSocket);
+
+    std::thread heartbeatThread(
+        heartbeatSender, udpSocket, udpAddress, userId
+    );
+
+    // Main thread handles keyboard input.
+    std::string message;
+
+    while (clientRunning)
+    {
+        {
+            std::lock_guard<std::mutex> lock(consoleMutex);
+            std::cout << "\nYou: " << std::flush;
+        }
+
+        if (!std::getline(std::cin, message))
+            break;
+
+        if (message == "/quit")
+        {
+            sendAll(tcpSocket, "/quit\n");
+            break;
+        }
+
+        if (message.empty())
+            continue;
+
+        if (!sendAll(
+            tcpSocket,
+            message + "\n"
+        ))
+        {
+            std::cerr << "Failed to send message.\n";
+            break;
+        }
+    }
+
+    clientRunning = false;
+
+    // Closing the TCP socket wakes the blocked recv() call.
+    shutdown(tcpSocket, SD_BOTH);
+
+    receiverThread.join();
+    heartbeatThread.join();
+
+    closesocket(tcpSocket);
+    closesocket(udpSocket);
+
     WSACleanup();
 
+    std::cout << "Client disconnected.\n";
     return 0;
 }
