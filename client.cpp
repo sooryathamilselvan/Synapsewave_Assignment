@@ -174,7 +174,7 @@ int main()
     // Authenticate before starting background threads.
     std::string userId;
 
-    std::cout << "Enter user ID (user1/user2/user3): ";
+    std::cout << "Enter user ID (user1/user2/..../user100): ";
     std::getline(std::cin, userId);
 
     if (userId.empty() || !sendAll(tcpSocket, userId + "\n"))
