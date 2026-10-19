@@ -238,7 +238,11 @@ bool connectToRedis()
 // --------------------------------------------------
 
 
-bool validateUserInDatabase(const std::string& userId)
+
+bool validateUserInDatabase(
+    const std::string& userId,
+    const std::string& password
+)
 {
     // Protect the shared MySQL connection.
     std::lock_guard<std::mutex> lock(dbMutex);
@@ -249,7 +253,6 @@ bool validateUserInDatabase(const std::string& userId)
         return false;
     }
 
-    // Create a prepared SQL statement.
     MYSQL_STMT* stmt = mysql_stmt_init(dbConnection);
 
     if (stmt == nullptr)
@@ -258,12 +261,14 @@ bool validateUserInDatabase(const std::string& userId)
         return false;
     }
 
+    // Check that BOTH the user ID and password match.
     const char* query =
         "SELECT UserId FROM tbl_UserDetails "
-        "WHERE UserId = ? LIMIT 1";
+        "WHERE UserId = ? AND Password = ? LIMIT 1";
 
     if (mysql_stmt_prepare(
-            stmt, query,
+            stmt,
+            query,
             static_cast<unsigned long>(std::strlen(query))) != 0)
     {
         std::cerr << "SQL prepare failed: "
@@ -273,17 +278,28 @@ bool validateUserInDatabase(const std::string& userId)
         return false;
     }
 
-    // Bind the incoming User ID to the ? placeholder.
-    MYSQL_BIND param{};
+    // Bind both input values to the prepared statement.
+    MYSQL_BIND params[2]{};
+
     unsigned long userIdLength =
         static_cast<unsigned long>(userId.size());
 
-    param.buffer_type = MYSQL_TYPE_STRING;
-    param.buffer = const_cast<char*>(userId.c_str());
-    param.buffer_length = userIdLength;
-    param.length = &userIdLength;
+    unsigned long passwordLength =
+        static_cast<unsigned long>(password.size());
 
-    if (mysql_stmt_bind_param(stmt, &param) != 0 ||
+    params[0].buffer_type = MYSQL_TYPE_STRING;
+    params[0].buffer =
+        const_cast<char*>(userId.c_str());
+    params[0].buffer_length = userIdLength;
+    params[0].length = &userIdLength;
+
+    params[1].buffer_type = MYSQL_TYPE_STRING;
+    params[1].buffer =
+        const_cast<char*>(password.c_str());
+    params[1].buffer_length = passwordLength;
+    params[1].length = &passwordLength;
+
+    if (mysql_stmt_bind_param(stmt, params) != 0 ||
         mysql_stmt_execute(stmt) != 0)
     {
         std::cerr << "SQL query failed: "
@@ -293,7 +309,6 @@ bool validateUserInDatabase(const std::string& userId)
         return false;
     }
 
-    // Check whether MySQL found the requested user.
     bool valid = false;
 
     if (mysql_stmt_store_result(stmt) == 0)
@@ -309,12 +324,15 @@ bool validateUserInDatabase(const std::string& userId)
     mysql_stmt_close(stmt);
 
     if (valid)
-        std::cout << "User validated: " << userId << '\n';
+        std::cout << "Credentials validated for: "
+                  << userId << '\n';
     else
-        std::cout << "User rejected: " << userId << '\n';
+        std::cout << "Invalid credentials for: "
+                  << userId << '\n';
 
     return valid;
 }
+
 
 
 bool validateUser(const std::string& userId)
@@ -340,7 +358,10 @@ bool validateUser(const std::string& userId)
             {
                 if (reply->type == REDIS_REPLY_STRING)
                 {
-                    std::string cachedValue(reply->str, reply->len);
+                    std::string cachedValue(
+                        reply->str, reply->len
+                    );
+
                     freeReplyObject(reply);
 
                     if (cachedValue == "1")
@@ -351,17 +372,58 @@ bool validateUser(const std::string& userId)
                 }
                 else
                 {
-                    // A nil response means the key is not cached.
                     freeReplyObject(reply);
                 }
             }
         }
     }
 
-    // 2. Cache miss or Redis unavailable: query MySQL.
-    const bool valid = validateUserInDatabase(userId);
+    // 2. Redis cache miss: check only whether the user exists.
+    bool valid = false;
 
-    // 3. Cache the result for 300 seconds when Redis is available.
+    {
+        std::lock_guard<std::mutex> lock(dbMutex);
+
+        if (dbConnection != nullptr)
+        {
+            MYSQL_STMT* stmt = mysql_stmt_init(dbConnection);
+
+            if (stmt != nullptr)
+            {
+                const char* query =
+                    "SELECT UserId FROM tbl_UserDetails "
+                    "WHERE UserId = ? LIMIT 1";
+
+                if (mysql_stmt_prepare(
+                        stmt, query,
+                        static_cast<unsigned long>(
+                            std::strlen(query))) == 0)
+                {
+                    MYSQL_BIND param{};
+
+                    unsigned long userIdLength =
+                        static_cast<unsigned long>(userId.size());
+
+                    param.buffer_type = MYSQL_TYPE_STRING;
+                    param.buffer =
+                        const_cast<char*>(userId.c_str());
+                    param.buffer_length = userIdLength;
+                    param.length = &userIdLength;
+
+                    if (mysql_stmt_bind_param(stmt, &param) == 0 &&
+                        mysql_stmt_execute(stmt) == 0 &&
+                        mysql_stmt_store_result(stmt) == 0)
+                    {
+                        valid = mysql_stmt_num_rows(stmt) > 0;
+                    }
+                }
+
+                mysql_stmt_close(stmt);
+            }
+        }
+    }
+
+    // 3. Cache the user-existence result for 300 seconds.
     {
         std::lock_guard<std::mutex> lock(redisMutex);
 
@@ -386,6 +448,17 @@ bool validateUser(const std::string& userId)
     }
 
     return valid;
+}
+
+
+bool validateUserCredentials(
+    const std::string& userId,
+    const std::string& password
+)
+{
+    // Always verify BOTH credentials against MySQL.
+    // Do not let the old Redis user-ID cache bypass login.
+    return validateUserInDatabase(userId, password);
 }
 
 
@@ -710,6 +783,7 @@ RdKafka::ErrorCode result = kafkaProducer->produce(
 
 
 
+
 void handleClient(
     SOCKET clientSocket,
     std::string clientAddress
@@ -717,28 +791,49 @@ void handleClient(
 {
     std::string pendingData;
     std::string userId;
-
     bool registered = false;
 
     logMessage("Client connected: " + clientAddress);
 
     // STEP 1: Receive the user ID.
+    std::string password;
+
     if (!receiveLine(clientSocket, pendingData, userId))
         goto cleanup;
 
-    // STEP 2: Validate the user ID.
-    if (!validateUser(userId))
+    // STEP 2: Receive the password.
+    if (!receiveLine(clientSocket, pendingData, password))
+        goto cleanup;
+
+    // STEP 3: Validate both credentials against MySQL.
+    if (!validateUserCredentials(userId, password))
     {
         logMessage(
             "Authentication failed for user ID: " + userId
         );
 
         sendAll(clientSocket, "AUTH_FAIL\n");
-
         goto cleanup;
     }
 
-    // STEP 3: Register the authenticated user for heartbeat tracking.
+    // STEP 4: Reserve this User ID for one active TCP session.
+    {
+        std::lock_guard<std::mutex> lock(userSocketsMutex);
+
+        if (userSockets.find(userId) != userSockets.end())
+        {
+            logMessage(
+                "Duplicate login rejected for: " + userId
+            );
+
+            sendAll(clientSocket, "AUTH_FAIL\n");
+            goto cleanup;
+        }
+
+        userSockets[userId] = clientSocket;
+    }
+
+    // STEP 5: Register the authenticated user for heartbeat tracking.
     {
         std::lock_guard<std::mutex> lock(heartbeatMutex);
 
@@ -754,22 +849,15 @@ void handleClient(
 
     logMessage("User validated: " + userId);
 
-    // Inform the client that authentication succeeded.
+    // STEP 6: Confirm successful authentication.
     if (!sendAll(clientSocket, "AUTH_OK\n"))
         goto cleanup;
-
-    // STEP 4: Register the user's TCP socket for private messages.
-    {
-        std::lock_guard<std::mutex> lock(userSocketsMutex);
-
-        userSockets[userId] = clientSocket;
-    }
 
     logMessage(
         "Waiting for UDP heartbeats from: " + userId
     );
 
-    // STEP 5: Process chat messages.
+    // STEP 7: Process incoming chat messages.
     while (serverRunning)
     {
         std::string message;
@@ -789,11 +877,8 @@ void handleClient(
         if (message == "/quit")
             break;
 
-        // ------------------------------------------
-        // PRIVATE MESSAGE COMMAND
+        // PRIVATE MESSAGE
         // Format: /msg <userID> <message>
-        // ------------------------------------------
-
         if (message.rfind("/msg ", 0) == 0)
         {
             size_t recipientStart = 5;
@@ -841,7 +926,7 @@ void handleClient(
                 continue;
             }
 
-            // Only send private messages to valid user IDs.
+            // Check whether the recipient is a valid user.
             if (!validateUser(recipient))
             {
                 sendAll(
@@ -861,60 +946,64 @@ void handleClient(
             continue;
         }
 
-        // ------------------------------------------
         // PUBLIC MESSAGE
-        // ------------------------------------------
+        logMessage(
+            "Message from " + userId + ": " + message
+        );
 
-        
-logMessage("Message from " + userId + ": " + message);
+        publishChatMessage(userId, message);
 
-publishChatMessage(userId, message);
+        std::string broadcast =
+            "[" + userId + "]: " + message + "\n";
 
-std::string broadcast =
-    "[" + userId + "]: " + message + "\n";
+        broadcastMessage(broadcast, clientSocket);
 
-broadcastMessage(broadcast, clientSocket);
-
-logMessage("Broadcast message from " + userId);
-
+        logMessage(
+            "Broadcast message from " + userId
+        );
     }
 
 cleanup:
 
-    // STEP 6: Remove the user from heartbeat tracking.
-    if (registered)
+    // STEP 8: Remove the socket mapping only if this
+    // connection still owns the User ID.
+    bool ownsSession = false;
+
     {
+        std::lock_guard<std::mutex> lock(userSocketsMutex);
+
+        auto it = userSockets.find(userId);
+
+        if (it != userSockets.end() &&
+            it->second == clientSocket)
         {
-            std::lock_guard<std::mutex> lock(heartbeatMutex);
-
-            authenticatedUsers.erase(userId);
-            lastHeartbeat.erase(userId);
-            timedOutUsers.erase(userId);
-        }
-
-        // STEP 7: Remove the user's private-message socket mapping.
-        {
-            std::lock_guard<std::mutex> lock(userSocketsMutex);
-
-            auto it = userSockets.find(userId);
-
-            // Do not erase a mapping that belongs to another socket.
-            if (it != userSockets.end() &&
-                it->second == clientSocket)
-            {
-                userSockets.erase(it);
-            }
+            userSockets.erase(it);
+            ownsSession = true;
         }
     }
 
-    // STEP 8: Remove the client and close its socket.
+    // STEP 9: Clear heartbeat state only for this
+    // authenticated, owning session.
+    if (registered && ownsSession)
+    {
+        std::lock_guard<std::mutex> lock(heartbeatMutex);
+
+        authenticatedUsers.erase(userId);
+        lastHeartbeat.erase(userId);
+        timedOutUsers.erase(userId);
+    }
+
+    // STEP 10: Remove the client and close the socket.
     removeClient(clientSocket);
 
     shutdown(clientSocket, SD_BOTH);
     closesocket(clientSocket);
 
-    logMessage("Client disconnected: " + clientAddress);
+    logMessage(
+        "Client disconnected: " + clientAddress
+    );
 }
+
 
 bool connectToKafka()
 {

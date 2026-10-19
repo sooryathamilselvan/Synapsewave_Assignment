@@ -172,14 +172,38 @@ int main()
     std::cout << "Connected to TCP chat server.\n";
 
     // Authenticate before starting background threads.
+    
+    // Authenticate before starting background threads.
     std::string userId;
+    std::string password;
 
     std::cout << "Enter user ID (user1/user2/..../user100): ";
     std::getline(std::cin, userId);
 
-    if (userId.empty() || !sendAll(tcpSocket, userId + "\n"))
+    std::cout << "Enter password: ";
+    std::getline(std::cin, password);
+
+    if (userId.empty() || password.empty())
+    {
+        std::cerr << "User ID and password cannot be empty.\n";
+        closesocket(tcpSocket);
+        WSACleanup();
+        return 1;
+    }
+
+    // Send the User ID as the first line.
+    if (!sendAll(tcpSocket, userId + "\n"))
     {
         std::cerr << "Failed to send user ID.\n";
+        closesocket(tcpSocket);
+        WSACleanup();
+        return 1;
+    }
+
+    // Send the password as the second line.
+    if (!sendAll(tcpSocket, password + "\n"))
+    {
+        std::cerr << "Failed to send password.\n";
         closesocket(tcpSocket);
         WSACleanup();
         return 1;
@@ -188,9 +212,10 @@ int main()
     std::string pending;
     std::string response;
 
+    // Wait for the server's authentication response.
     if (!receiveLine(tcpSocket, pending, response))
     {
-        std::cerr << "Server disconnected.\n";
+        std::cerr << "Server disconnected during authentication.\n";
         closesocket(tcpSocket);
         WSACleanup();
         return 1;
@@ -198,11 +223,15 @@ int main()
 
     if (response != "AUTH_OK")
     {
-        std::cout << "Access denied: invalid user ID.\n";
+        std::cout << "Access denied: invalid User ID or password.\n";
         closesocket(tcpSocket);
         WSACleanup();
         return 0;
     }
+
+    std::cout << "Authentication successful!\n";
+    std::cout << "Type /quit to disconnect.\n";
+
 
     std::cout << "Authentication successful!\n";
     std::cout << "Type /quit to disconnect.\n";
