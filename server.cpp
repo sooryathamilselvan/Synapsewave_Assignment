@@ -1,6 +1,9 @@
 
 #define WIN32_LEAN_AND_MEAN
 
+#include <librdkafka/rdkafkacpp.h>
+#include <memory>
+#include <iomanip>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iostream>
@@ -17,6 +20,7 @@
 #include <ctime>
 #include <unordered_set>
 #include <unordered_map>
+#include <sstream>
 
 const int TCP_PORT = 5000;
 const int UDP_PORT = 5001;
@@ -34,6 +38,10 @@ std::vector<std::thread> clientThreads;
 std::vector<SOCKET> clients;
 redisContext* redisConnection = nullptr;
 std::mutex redisMutex;
+RdKafka::Producer* kafkaProducer = nullptr;
+std::mutex kafkaMutex;
+
+const std::string KAFKA_TOPIC = "chat-messages";
 
 const int REDIS_CACHE_TTL = 300;
 
@@ -525,24 +533,19 @@ void heartbeatMonitor()
 // PUBLIC MESSAGE BROADCAST
 // --------------------------------------------------
 
-void broadcastMessage(
-    const std::string& message,
-    SOCKET senderSocket
-)
+void broadcastMessage(const std::string& message, SOCKET senderSocket)
 {
     std::lock_guard<std::mutex> lock(clientsMutex);
 
     for (SOCKET clientSocket : clients)
     {
-        // Do not send the public message back to its sender.
+        // Send the message to every client except the sender.
         if (clientSocket == senderSocket)
             continue;
 
         if (!sendAll(clientSocket, message))
         {
-            logMessage(
-                "Failed to broadcast a message to a client."
-            );
+            logMessage("Failed to send message to a client.");
         }
     }
 }
@@ -605,6 +608,107 @@ void sendPrivateMessage(
 // --------------------------------------------------
 // HANDLE EACH TCP CLIENT
 // --------------------------------------------------
+
+std::string escapeJson(const std::string& value)
+{
+    std::string result;
+
+    for (unsigned char ch : value)
+    {
+        switch (ch)
+        {
+        case '"':  result += "\\\""; break;
+        case '\\': result += "\\\\"; break;
+        case '\b': result += "\\b";  break;
+        case '\f': result += "\\f";  break;
+        case '\n': result += "\\n";  break;
+        case '\r': result += "\\r";  break;
+        case '\t': result += "\\t";  break;
+
+        default:
+            if (ch < 0x20)
+            {
+                const char hex[] = "0123456789abcdef";
+                result += "\\u00";
+                result += hex[ch >> 4];
+                result += hex[ch & 0x0f];
+            }
+            else
+            {
+                result += static_cast<char>(ch);
+            }
+        }
+    }
+
+    return result;
+}
+
+std::string currentTimestamp()
+{
+    std::time_t now = std::time(nullptr);
+    std::tm timeInfo{};
+
+#ifdef _WIN32
+    localtime_s(&timeInfo, &now);
+#else
+    localtime_r(&now, &timeInfo);
+#endif
+
+    std::ostringstream output;
+    output << std::put_time(&timeInfo, "%Y-%m-%d %H:%M:%S");
+
+    return output.str();
+}
+
+bool publishChatMessage(
+    const std::string& userId,
+    const std::string& message)
+{
+    std::lock_guard<std::mutex> lock(kafkaMutex);
+
+    if (kafkaProducer == nullptr)
+    {
+        logMessage("Kafka unavailable; message was not published.");
+        return false;
+    }
+
+    const std::string payload =
+        "{\"userId\":\"" + escapeJson(userId) +
+        "\",\"timestamp\":\"" + currentTimestamp() +
+        "\",\"message\":\"" + escapeJson(message) + "\"}";
+
+    
+RdKafka::ErrorCode result = kafkaProducer->produce(
+    KAFKA_TOPIC,
+    RdKafka::Topic::PARTITION_UA,
+    RdKafka::Producer::RK_MSG_COPY,
+    const_cast<char*>(payload.data()),
+    payload.size(),
+    userId.data(),
+    userId.size(),
+    0,
+    nullptr
+);
+
+
+    if (result != RdKafka::ERR_NO_ERROR)
+    {
+        logMessage(
+            "Kafka publish enqueue failed: " +
+            RdKafka::err2str(result)
+        );
+
+        return false;
+    }
+
+    // Process available Kafka events and delivery reports.
+    kafkaProducer->poll(0);
+
+    logMessage("Chat message queued for Kafka: " + userId);
+    return true;
+}
+
+
 
 void handleClient(
     SOCKET clientSocket,
@@ -761,18 +865,18 @@ void handleClient(
         // PUBLIC MESSAGE
         // ------------------------------------------
 
-        logMessage(
-            "Message from " + userId + ": " + message
-        );
+        
+logMessage("Message from " + userId + ": " + message);
 
-        std::string broadcast =
-            "[" + userId + "]: " + message + "\n";
+publishChatMessage(userId, message);
 
-        broadcastMessage(broadcast, clientSocket);
+std::string broadcast =
+    "[" + userId + "]: " + message + "\n";
 
-        logMessage(
-            "Broadcast message from " + userId
-        );
+broadcastMessage(broadcast, clientSocket);
+
+logMessage("Broadcast message from " + userId);
+
     }
 
 cleanup:
@@ -810,6 +914,47 @@ cleanup:
     closesocket(clientSocket);
 
     logMessage("Client disconnected: " + clientAddress);
+}
+
+bool connectToKafka()
+{
+    std::string error;
+
+    RdKafka::Conf* config =
+        RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
+
+    if (config == nullptr)
+    {
+        std::cerr << "Could not create Kafka configuration.\n";
+        return false;
+    }
+
+    if (config->set(
+            "metadata.broker.list",
+            "127.0.0.1:9092",
+            error) != RdKafka::Conf::CONF_OK)
+    {
+        std::cerr << "Kafka configuration failed: "
+                  << error << '\n';
+
+        delete config;
+        return false;
+    }
+
+    kafkaProducer = RdKafka::Producer::create(config, error);
+
+    // The Producer takes ownership of the configuration.
+    if (kafkaProducer == nullptr)
+    {
+        std::cerr << "Kafka producer creation failed: "
+                  << error << '\n';
+
+        delete config;
+        return false;
+    }
+
+    std::cout << "Kafka producer initialized successfully.\n";
+    return true;
 }
 
 
@@ -940,6 +1085,11 @@ int main()
     logMessage("UDP Heartbeat Server started on port 5001.");
     logMessage("Heartbeat timeout: 15 seconds.");
 
+    if (!connectToKafka())
+{
+    logMessage("Kafka producer unavailable.");
+}
+
     std::thread receiverThread(
         heartbeatReceiver,
         udpSocket
@@ -1001,18 +1151,46 @@ int main()
     }
 
     // Server shutdown.
+
+    // Server shutdown.
     serverRunning = false;
 
+    // 1. Stop accepting new TCP connections.
     shutdown(serverSocket, SD_BOTH);
     closesocket(serverSocket);
 
-    // Wake the UDP receiver if it is blocked.
+    // 2. Interrupt all connected clients so their threads can exit.
+    {
+        std::lock_guard<std::mutex> lock(clientsMutex);
+
+        for (SOCKET clientSocket : clients)
+        {
+            shutdown(clientSocket, SD_BOTH);
+        }
+    }
+
+    // 3. Stop the UDP heartbeat receiver.
     closesocket(udpSocket);
 
-    receiverThread.join();
-    monitorThread.join();
+    // 4. Wait for the heartbeat threads to finish.
+    if (receiverThread.joinable())
+        receiverThread.join();
 
+    if (monitorThread.joinable())
+        monitorThread.join();
+
+    // 5. Wait for every client-handling thread to finish.
+    for (std::thread& clientThread : clientThreads)
+    {
+        if (clientThread.joinable())
+            clientThread.join();
+    }
+
+    // 6. Release Winsock resources.
     WSACleanup();
+
+    logMessage("Server shutdown completed.");
 
     return 0;
 }
+
