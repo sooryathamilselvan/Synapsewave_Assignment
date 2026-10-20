@@ -997,7 +997,97 @@ RdKafka::ErrorCode result = kafkaProducer->produce(
     return true;
 }
 
+bool isLoginLocked(const std::string& userId)
+{
+    std::lock_guard<std::mutex> lock(redisMutex);
 
+    if (redisConnection == nullptr || redisConnection->err != 0)
+        return false; // Redis unavailable: allow normal MySQL verification
+
+    const std::string key = "login-locked:" + userId;
+
+    redisReply* reply = static_cast<redisReply*>(
+        redisCommand(redisConnection, "EXISTS %s", key.c_str())
+    );
+
+    if (reply == nullptr)
+        return false;
+
+    bool locked =
+        reply->type == REDIS_REPLY_INTEGER && reply->integer == 1;
+
+    freeReplyObject(reply);
+    return locked;
+}
+
+void recordFailedLogin(const std::string& userId)
+{
+    std::lock_guard<std::mutex> lock(redisMutex);
+
+    if (redisConnection == nullptr || redisConnection->err != 0)
+        return;
+
+    const std::string attemptsKey = "login-failures:" + userId;
+    const std::string lockKey = "login-locked:" + userId;
+
+    // Increase the number of failed attempts atomically.
+    redisReply* reply = static_cast<redisReply*>(
+        redisCommand(redisConnection, "INCR %s", attemptsKey.c_str())
+    );
+
+    if (reply == nullptr)
+        return;
+
+    long long attempts =
+        reply->type == REDIS_REPLY_INTEGER ? reply->integer : 0;
+
+    freeReplyObject(reply);
+
+    // Expire the counter 60 seconds after its first failed attempt.
+    redisReply* ttlReply = static_cast<redisReply*>(
+        redisCommand(
+            redisConnection, "EXPIRE %s 60 NX", attemptsKey.c_str()
+        )
+    );
+
+    if (ttlReply != nullptr)
+        freeReplyObject(ttlReply);
+
+    // Lock after three failed attempts, for 60 seconds.
+    if (attempts >= 3)
+    {
+        redisReply* lockReply = static_cast<redisReply*>(
+            redisCommand(
+                redisConnection, "SET %s 1 EX 60",
+                lockKey.c_str()
+            )
+        );
+
+        if (lockReply != nullptr)
+            freeReplyObject(lockReply);
+    }
+}
+
+void clearFailedLogins(const std::string& userId)
+{
+    std::lock_guard<std::mutex> lock(redisMutex);
+
+    if (redisConnection == nullptr || redisConnection->err != 0)
+        return;
+
+    const std::string attemptsKey = "login-failures:" + userId;
+    const std::string lockKey = "login-locked:" + userId;
+
+    redisReply* reply = static_cast<redisReply*>(
+        redisCommand(
+            redisConnection, "DEL %s %s",
+            attemptsKey.c_str(), lockKey.c_str()
+        )
+    );
+
+    if (reply != nullptr)
+        freeReplyObject(reply);
+}
 
 
 void handleClient(
@@ -1023,15 +1113,32 @@ bool registered = false;
         goto cleanup;
 
     // STEP 3: Validate both credentials against MySQL.
-    if (!validateUserCredentials(userId, password))
-    {
-        logMessage(
-            "Authentication failed for user ID: " + userId
-        );
+    // STEP 3: Check whether the user is temporarily locked.
+if (isLoginLocked(userId))
+{
+    logMessage("Login temporarily blocked for: " + userId);
 
-        sendAll(clientSocket, "AUTH_FAIL\n");
-        goto cleanup;
-    }
+    sendAll(
+        clientSocket,
+        "AUTH_FAIL\nToo many failed attempts. Try again in 60 seconds.\n"
+    );
+
+    goto cleanup;
+}
+
+// STEP 4: Verify the actual credentials against MySQL.
+if (!validateUserCredentials(userId, password))
+{
+    recordFailedLogin(userId);
+
+    logMessage("Authentication failed for user ID: " + userId);
+
+    sendAll(clientSocket, "AUTH_FAIL\n");
+    goto cleanup;
+}
+
+// Correct credentials: clear previous failed attempts.
+clearFailedLogins(userId);
 
     // STEP 4: Reserve this User ID for one active TCP session.
     {
