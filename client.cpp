@@ -130,6 +130,49 @@ void heartbeatSender(
     }
 }
 
+
+bool receiveChatHistory(SOCKET tcpSocket)
+{
+    std::string history;
+    char buffer[4096];
+
+    const std::string endMarker =
+        "=========================================\n";
+
+    while (history.find(endMarker) == std::string::npos)
+    {
+        int received = recv(
+            tcpSocket,
+            buffer,
+            sizeof(buffer),
+            0
+        );
+
+        if (received <= 0)
+        {
+            std::cerr
+                << "Connection closed while receiving chat history.\n";
+            return false;
+        }
+
+        history.append(buffer, received);
+
+        if (history.size() > 1024 * 1024)
+        {
+            std::cerr << "Chat history is too large.\n";
+            return false;
+        }
+    }
+
+    size_t endPosition = history.find(endMarker);
+    size_t displayLength = endPosition + endMarker.size();
+
+    std::cout << history.substr(0, displayLength);
+
+    return true;
+}
+
+
 int main()
 {
     WSADATA wsaData{};
@@ -228,6 +271,16 @@ int main()
         WSACleanup();
         return 0;
     }
+
+    // Display previous chat messages after successful login.
+if (!receiveChatHistory(tcpSocket))
+{
+    closesocket(tcpSocket);
+    WSACleanup();
+    return 1;
+}
+
+std::cout << "Login successful!\n";
 
     std::cout << "Authentication successful!\n";
     std::cout << "Type /quit to disconnect.\n";

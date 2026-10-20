@@ -1,4 +1,5 @@
-
+//g++ server.cpp -o server.exe -std=c++17 -Wall -Wextra -lws2_32 -lmariadb -lhiredis -lrdkafka++
+// ./server.exe
 #define WIN32_LEAN_AND_MEAN
 
 #include <librdkafka/rdkafkacpp.h>
@@ -164,17 +165,20 @@ bool sendAll(SOCKET sock, const std::string& message)
     return true;
 }
 
+
 bool connectToDatabase()
 {
     const char* username = std::getenv("CHATDB_USER");
     const char* password = std::getenv("CHATDB_PASSWORD");
 
+    // Step 1: Check environment variables
     if (username == nullptr || password == nullptr)
     {
         std::cerr << "Missing CHATDB_USER or CHATDB_PASSWORD.\n";
         return false;
     }
 
+    // Step 2: Initialize MySQL
     dbConnection = mysql_init(nullptr);
 
     if (dbConnection == nullptr)
@@ -183,12 +187,13 @@ bool connectToDatabase()
         return false;
     }
 
+    // Step 3: Connect to the database
     if (mysql_real_connect(
             dbConnection,
             "127.0.0.1",
             username,
             password,
-            "ChatDB",
+            "chatdb",
             3306,
             nullptr,
             0) == nullptr)
@@ -201,7 +206,47 @@ bool connectToDatabase()
         return false;
     }
 
+    // Step 4: Print connection information
+    std::cout << "Connected host: "
+              << mysql_get_host_info(dbConnection) << '\n';
+
+    std::cout << "MySQL server version: "
+              << mysql_get_server_info(dbConnection) << '\n';
+
+    // Step 5: Identify the MySQL account and selected database
+    if (mysql_query(dbConnection, "SELECT USER(), DATABASE()") == 0)
+    {
+        MYSQL_RES* result = mysql_store_result(dbConnection);
+
+        if (result != nullptr)
+        {
+            MYSQL_ROW row = mysql_fetch_row(result);
+
+            if (row != nullptr)
+            {
+                std::cout << "MySQL account: "
+                          << (row[0] ? row[0] : "unknown") << '\n';
+
+                std::cout << "Selected database: "
+                          << (row[1] ? row[1] : "unknown") << '\n';
+            }
+
+            mysql_free_result(result);
+        }
+        else
+        {
+            std::cerr << "Could not read MySQL connection details: "
+                      << mysql_error(dbConnection) << '\n';
+        }
+    }
+    else
+    {
+        std::cerr << "Connection diagnostic query failed: "
+                  << mysql_error(dbConnection) << '\n';
+    }
+
     std::cout << "Connected to ChatDB successfully.\n";
+
     return true;
 }
 
@@ -333,6 +378,177 @@ bool validateUserInDatabase(
     return valid;
 }
 
+
+std::string getChatHistory(int limit = 20)
+{
+    // Protect the shared MySQL connection.
+    std::lock_guard<std::mutex> lock(dbMutex);
+
+    if (dbConnection == nullptr)
+    {
+        std::cerr << "Database connection is unavailable.\n";
+        return "Chat history is currently unavailable.\n";
+    }
+
+    MYSQL_STMT* stmt = mysql_stmt_init(dbConnection);
+
+    if (stmt == nullptr)
+    {
+        std::cerr << "Could not initialize history statement.\n";
+        return "Chat history is currently unavailable.\n";
+    }
+
+    // Fetch the newest messages first in a subquery,
+    // then display them from oldest to newest.
+    const char* query =
+        "SELECT UserId, Timestamp, ChatMessage "
+        "FROM ("
+        "  SELECT UserId, Timestamp, ChatMessage, UniqueId "
+        "  FROM chatdb.tbl_chatdetails "
+        "  ORDER BY Timestamp DESC, UniqueId DESC "
+        "  LIMIT ?"
+        ") AS recent "
+        "ORDER BY Timestamp ASC, UniqueId ASC";
+
+    if (mysql_stmt_prepare(
+            stmt,
+            query,
+            static_cast<unsigned long>(std::strlen(query))) != 0)
+    {
+        std::cerr << "History prepare failed: "
+                  << mysql_stmt_error(stmt) << '\n';
+
+        mysql_stmt_close(stmt);
+        return "Chat history is currently unavailable.\n";
+    }
+
+    // Bind the requested message count.
+    unsigned long messageLimit =
+        static_cast<unsigned long>(limit);
+
+    MYSQL_BIND params[1]{};
+    params[0].buffer_type = MYSQL_TYPE_LONG;
+    params[0].buffer = &messageLimit;
+    params[0].is_unsigned = true;
+
+    if (mysql_stmt_bind_param(stmt, params) != 0 ||
+        mysql_stmt_execute(stmt) != 0)
+    {
+        std::cerr << "History query failed: "
+                  << mysql_stmt_error(stmt) << '\n';
+
+        mysql_stmt_close(stmt);
+        return "Chat history is currently unavailable.\n";
+    }
+
+    // Buffer the result so we can read each row.
+    if (mysql_stmt_store_result(stmt) != 0)
+    {
+        std::cerr << "History result failed: "
+                  << mysql_stmt_error(stmt) << '\n';
+
+        mysql_stmt_close(stmt);
+        return "Chat history is currently unavailable.\n";
+    }
+
+    std::string history;
+    history += "\n========== RECENT CHAT HISTORY ==========\n";
+
+    MYSQL_BIND results[3]{};
+
+    char userIdBuffer[201]{};
+    char timestampBuffer[32]{};
+    char messageBuffer[4096]{};
+
+    unsigned long userIdLength = 0;
+    unsigned long timestampLength = 0;
+    unsigned long messageLength = 0;
+
+    my_bool userIdNull = 0;
+my_bool timestampNull = 0;
+my_bool messageNull = 0;
+
+    results[0].buffer_type = MYSQL_TYPE_STRING;
+    results[0].buffer = userIdBuffer;
+    results[0].buffer_length = sizeof(userIdBuffer) - 1;
+    results[0].length = &userIdLength;
+    results[0].is_null = &userIdNull;
+
+    results[1].buffer_type = MYSQL_TYPE_STRING;
+    results[1].buffer = timestampBuffer;
+    results[1].buffer_length = sizeof(timestampBuffer) - 1;
+    results[1].length = &timestampLength;
+    results[1].is_null = &timestampNull;
+
+    results[2].buffer_type = MYSQL_TYPE_STRING;
+    results[2].buffer = messageBuffer;
+    results[2].buffer_length = sizeof(messageBuffer) - 1;
+    results[2].length = &messageLength;
+    results[2].is_null = &messageNull;
+
+    if (mysql_stmt_bind_result(stmt, results) != 0)
+    {
+        std::cerr << "History bind result failed: "
+                  << mysql_stmt_error(stmt) << '\n';
+
+        mysql_stmt_close(stmt);
+        return "Chat history is currently unavailable.\n";
+    }
+
+    bool foundMessages = false;
+
+    while (true)
+    {
+        int fetchStatus = mysql_stmt_fetch(stmt);
+
+        if (fetchStatus == MYSQL_NO_DATA)
+            break;
+
+        if (fetchStatus != 0 &&
+            fetchStatus != MYSQL_DATA_TRUNCATED)
+        {
+            std::cerr << "History fetch failed: "
+                      << mysql_stmt_error(stmt) << '\n';
+            break;
+        }
+
+        // Skip rows that exceed our fixed buffers.
+        // This simple version does not retrieve truncated fields.
+        if (fetchStatus == MYSQL_DATA_TRUNCATED ||
+            userIdNull || timestampNull || messageNull ||
+            userIdLength >= sizeof(userIdBuffer) ||
+            timestampLength >= sizeof(timestampBuffer) ||
+            messageLength >= sizeof(messageBuffer))
+        {
+            history += "[A history message was too large to display.]\n";
+            continue;
+        }
+
+        userIdBuffer[userIdLength] = '\0';
+        timestampBuffer[timestampLength] = '\0';
+        messageBuffer[messageLength] = '\0';
+
+        history += "[";
+        history += timestampBuffer;
+        history += "] ";
+        history += userIdBuffer;
+        history += ": ";
+        history += messageBuffer;
+        history += "\n";
+
+        foundMessages = true;
+    }
+
+    if (!foundMessages)
+        history += "No previous messages found.\n";
+
+    history += "=========================================\n";
+
+    mysql_stmt_free_result(stmt);
+    mysql_stmt_close(stmt);
+
+    return history;
+}
 
 
 bool validateUser(const std::string& userId)
@@ -790,8 +1006,9 @@ void handleClient(
 )
 {
     std::string pendingData;
-    std::string userId;
-    bool registered = false;
+std::string userId;
+std::string history;
+bool registered = false;
 
     logMessage("Client connected: " + clientAddress);
 
@@ -850,12 +1067,29 @@ void handleClient(
     logMessage("User validated: " + userId);
 
     // STEP 6: Confirm successful authentication.
-    if (!sendAll(clientSocket, "AUTH_OK\n"))
-        goto cleanup;
+    // Confirm successful authentication.
+if (!sendAll(clientSocket, "AUTH_OK\n"))
+    goto cleanup;
 
+// Retrieve and send recent chat history.
+history = getChatHistory(20);
+
+if (!sendAll(clientSocket, history))
+{
     logMessage(
-        "Waiting for UDP heartbeats from: " + userId
+        "Failed to send chat history to: " + userId
     );
+
+    goto cleanup;
+}
+
+logMessage(
+    "Chat history sent to: " + userId
+);
+
+logMessage(
+    "Waiting for UDP heartbeats from: " + userId
+);
 
     // STEP 7: Process incoming chat messages.
     while (serverRunning)
